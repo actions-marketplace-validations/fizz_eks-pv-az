@@ -15,19 +15,18 @@
 #   relocate                Move one PVC's volume to another AZ.
 #   heal                    Relocate every stranded volume, unattended.
 #
-# Runs as a composite action (`uses: d33pthinkers/eks-pv-az@<commit SHA>`) and
-# by hand. nistagent-infra and td-infra both call it from their unpark jobs.
+# Runs as a composite action (`uses: fizz/eks-pv-az@<commit SHA>`) and by hand.
 #
 # Usage by hand:
-#   ./pv-az-relocate.sh detect --context devops --region us-east-1
+#   ./pv-az-relocate.sh detect --context my-cluster --region us-east-1
 #
-#   ./pv-az-relocate.sh relocate --context devops --region us-east-1 \
-#       --namespace openobserve --pvc cache-openobserve-querier-0
+#   ./pv-az-relocate.sh relocate --context my-cluster --region us-east-1 \
+#       --namespace monitoring --pvc data-prometheus-0
 #       # destination AZ is chosen automatically; add --apply to execute
 #
 #   ./pv-az-relocate.sh relocate ... --to us-east-1c --apply
 #
-#   ./pv-az-relocate.sh heal --context devops --region us-east-1 --apply
+#   ./pv-az-relocate.sh heal --context my-cluster --region us-east-1 --apply
 #       # what unpark runs: move any volume whose zone has no node its pod can run on
 #
 # Requires:

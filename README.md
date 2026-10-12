@@ -7,7 +7,7 @@ This action finds those volumes and moves them. It snapshots the volume, creates
 ## Usage
 
 ```yaml
-- uses: d33pthinkers/eks-pv-az@<commit SHA>
+- uses: fizz/eks-pv-az@<commit SHA>
   with:
     mode: heal          # detect | heal | relocate
     context: my-cluster
