@@ -1,0 +1,58 @@
+name: PV availability-zone repair
+description: >
+  Detect or relocate EBS-backed PersistentVolumes whose Availability Zone has no
+  node the pod can run on. Use it as d33pthinkers/eks-pv-az@<commit SHA>.
+
+inputs:
+  mode:
+    description: 'detect (read-only), heal (relocate everything stranded), or relocate (one PVC)'
+    required: true
+    default: detect
+  context:
+    description: 'kubectl context'
+    required: true
+  region:
+    description: 'AWS region'
+    required: true
+  apply:
+    description: 'Execute. Anything other than true is a dry run.'
+    required: false
+    default: 'false'
+  namespace:
+    description: 'relocate only: namespace of the PVC'
+    required: false
+    default: ''
+  pvc:
+    description: 'relocate only: PVC name'
+    required: false
+    default: ''
+  to_az:
+    description: 'relocate only: destination AZ. Blank picks the zone with the most free CPU.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        CONTEXT: ${{ inputs.context }}
+        REGION: ${{ inputs.region }}
+        APPLY: ${{ inputs.apply }}
+        NS: ${{ inputs.namespace }}
+        PVC_NAME: ${{ inputs.pvc }}
+        TO_AZ: ${{ inputs.to_az }}
+      run: |
+        # GITHUB_ACTION_PATH is where this action's own files were placed, which
+        # is what makes the script reachable without the caller checking out.
+        SCRIPT="$GITHUB_ACTION_PATH/pv-az-relocate.sh"
+        chmod +x "$SCRIPT"
+
+        set -- "$MODE" --context "$CONTEXT" --region "$REGION"
+        [ "$APPLY" = "true" ] && set -- "$@" --apply
+        [ -n "$NS" ] && set -- "$@" --namespace "$NS"
+        [ -n "$PVC_NAME" ] && set -- "$@" --pvc "$PVC_NAME"
+        [ -n "$TO_AZ" ] && set -- "$@" --to "$TO_AZ"
+
+        "$SCRIPT" "$@"
