@@ -42,3 +42,71 @@ Free CPU alone is not enough. A zone can have a node with spare CPU that the pod
 ```
 
 Requires `kubectl`, `aws` and `jq`.
+
+## Permissions
+
+The action uses the caller's AWS credentials and kubectl context. `detect` and every dry run need only the read permissions.
+
+### AWS IAM
+
+| Action | Used for |
+|---|---|
+| `ec2:DescribeVolumes` | Read the zone of each volume. Wait for the new volume. |
+| `ec2:DescribeSnapshots` | Wait for the snapshot. |
+| `ec2:CreateSnapshot` | Snapshot the stranded volume. |
+| `ec2:CreateVolume` | Create the replacement volume from the snapshot. |
+| `ec2:CreateTags` | Tag the snapshot and the volume when they are created. |
+
+The action needs no delete permission. It keeps the source volume and the snapshot.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Read",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeVolumes", "ec2:DescribeSnapshots"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Relocate",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateSnapshot", "ec2:CreateVolume"],
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*::snapshot/*"
+      ]
+    },
+    {
+      "Sid": "TagOnCreate",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*::snapshot/*"
+      ],
+      "Condition": {
+        "StringEquals": { "ec2:CreateAction": ["CreateSnapshot", "CreateVolume"] }
+      }
+    }
+  ]
+}
+```
+
+If a customer managed KMS key encrypts the volumes, the role also needs `kms:CreateGrant`, `kms:Decrypt`, `kms:DescribeKey` and `kms:GenerateDataKeyWithoutPlaintext` on that key. In GovCloud, use `arn:aws-us-gov` in the resource ARNs.
+
+### Kubernetes RBAC
+
+| Resource | Verbs | Used for |
+|---|---|---|
+| `nodes` | get, list | Zones, taints, labels and free CPU of each node |
+| `pods` | get, list | Pending pods and their scheduling rules |
+| `persistentvolumes` | get, list, patch, delete, create | Set `Retain`, then replace the PV |
+| `persistentvolumeclaims` | get, list, delete, create | Replace the PVC |
+| `volumeattachments` (`storage.k8s.io`) | list | Find volumes that a dead pod still holds |
+| `replicasets` (`apps`) | get | Find the Deployment that owns a pod |
+| `deployments`, `statefulsets` (`apps`) | get | Read the replica count |
+| `deployments/scale`, `statefulsets/scale` (`apps`) | get, patch, update | Stop the owner during the move, then restore it |
+
+`detect` and dry runs need only the get and list verbs. On EKS, an access entry for the role can grant these through a ClusterRole.
