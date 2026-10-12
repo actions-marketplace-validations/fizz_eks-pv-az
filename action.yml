@@ -1,7 +1,5 @@
 name: PV availability-zone repair
-description: >
-  Detect or relocate EBS-backed PersistentVolumes whose Availability Zone has no
-  node the pod can run on. Use it as fizz/eks-pv-az@<commit SHA>.
+description: 'Move EBS-backed PersistentVolumes to an Availability Zone that has a node their pod can run on.'
 
 branding:
   icon: hard-drive
