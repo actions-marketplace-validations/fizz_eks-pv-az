@@ -11,9 +11,16 @@
 # volume, move the volume to where the nodes actually are."
 #
 # Modes:
-#   detect                  Report PVs whose zone has no usable node. Read-only.
+#   detect                  Report every pending claim its pod cannot be placed
+#                           for, and why. Read-only. Exits 1 on any finding.
+#                           --json prints the verdict as an array and nothing
+#                           else, for a caller to parse.
 #   relocate                Move one PVC's volume to another AZ.
 #   heal                    Relocate every stranded volume, unattended.
+#
+# detect and heal share one verdict (classify_claims_json), so they cannot
+# disagree about whether a pod is stuck. detect reports every class; heal moves
+# the one class a volume move can fix and names the rest.
 #
 # Runs as a composite action (`uses: fizz/eks-pv-az@<commit SHA>`) and by hand.
 #
@@ -58,7 +65,7 @@
 
 set -euo pipefail
 
-CONTEXT=""; REGION=""; NAMESPACE=""; PVC=""; TO_AZ=""; APPLY=0; MODE=""
+CONTEXT=""; REGION=""; NAMESPACE=""; PVC=""; TO_AZ=""; APPLY=0; MODE=""; JSON=0
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "  $*"; }
@@ -86,10 +93,13 @@ while [ $# -gt 0 ]; do
     --pvc)       PVC="$2"; shift 2 ;;
     --to)        TO_AZ="$2"; shift 2 ;;
     --apply)     APPLY=1; shift ;;
+    --json)      JSON=1; shift ;;
     -h|--help)   usage 0 ;;
     *) die "unknown flag '$1'" ;;
   esac
 done
+
+[ "$JSON" = 0 ] || [ "$MODE" = detect ] || die "--json is only for detect"
 
 [ -n "$CONTEXT" ] || die "--context is required"
 [ -n "$REGION" ] || die "--region is required"
@@ -264,35 +274,126 @@ PY
 }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pv-az-relocate.XXXXXX")
-note "work dir: $WORK"
+# Under --json, stdout carries the verdict and nothing else, so a caller can
+# pipe it straight into jq.
+[ "$JSON" = 1 ] || note "work dir: $WORK"
+
+# ------------------------------------------------------------------ verdict
+
+# One verdict for every mode. detect reports it and heal acts on it, so the two
+# can never disagree about whether a pod is stuck -- which they did until now:
+# detect asked "does the volume's zone have ANY usable node" and heal asked "does
+# it have a node THIS POD may run on". A dedicated node group in the zone made
+# detect say fine and heal say stranded about the same volume.
+#
+# Reads the three inventory files; zone_capacity_json, pinned_pvs_json and
+# blocked_claims_json must have run first.
+#
+# class:
+#   stranded        the pod has nodes it may run on, none of them in the
+#                   volume's zone has room, and another zone does. heal moves
+#                   the volume there.
+#   no-destination  stranded, but no zone has a node with room for the pod.
+#                   Moving the volume only strands it somewhere else.
+#   unschedulable   the pod matches no node in the cluster at all: its
+#                   nodeSelector, required affinity or tolerations exclude every
+#                   one. No volume move can help. The placement or the node
+#                   groups have to change.
+#   unzoned         the claim's PV declares no zone, so this tool cannot reason
+#                   about it. Named rather than skipped, because a pod can sit
+#                   Pending forever behind a hand-made PV that carries no
+#                   nodeAffinity and nothing here would ever mention it.
+#
+# A claim whose pod has a node with room is dropped: nothing to report.
+classify_claims_json() {
+  jq -n \
+    --slurpfile z "$WORK/zones.json" \
+    --slurpfile p "$WORK/pvs.json" \
+    --slurpfile b "$WORK/blocked.json" \
+    --argjson minage "${MIN_PENDING_SECONDS:-120}" '
+    [ $b[0][]
+      | select(.pending_seconds >= $minage)
+      | . as $need
+      | (.fit_nodes) as $fit
+      | ([ $p[0][] | select(.namespace == $need.namespace and .claim == $need.claim) ] | first) as $pv
+      | ($pv.zones // []) as $zones
+      # Only nodes the pod could run on count, in the zone of the volume and elsewhere.
+      | ($zones | map(($z[0][.] // {usable_nodes:[]}).usable_nodes[]?
+          | select(.name as $n | $fit | index($n)) | .free_cpu_m)) as $free
+      | ($free | max // 0) as $best
+      # The destination is a zone the volume is not in, with one node that has
+      # room for the pod. The most free CPU wins. Null when no zone qualifies.
+      | ($z[0] | to_entries
+          | map(select(.key as $k | ($zones | index($k)) == null)
+                | select(([.value.usable_nodes[]? | select(.name as $n | $fit | index($n))
+                           | .free_cpu_m] | max // -1) >= $need.cpu_m))
+          | sort_by(-.value.free_cpu_m) | .[0].key // null) as $dest
+      | (if ($fit | length) == 0 then "unschedulable"
+         elif $pv == null then "unzoned"
+         # No usable node at all strands the volume, whatever the pod asks for.
+         # Without this, a pod with no CPU request never counts: 0 < 0 is false.
+         elif ($free | length) > 0 and $best >= $need.cpu_m then "ok"
+         elif $dest == null then "no-destination"
+         else "stranded" end) as $class
+      | select($class != "ok")
+      | { class: $class,
+          namespace: $need.namespace, claim: $need.claim, pod: $need.pod,
+          pv: ($pv.pv // null), zones: $zones,
+          capacity: ($pv.capacity // null), storageClass: ($pv.storageClass // null),
+          reclaim: ($pv.reclaim // null), volumeHandle: ($pv.volumeHandle // null),
+          needs_cpu_m: $need.cpu_m, best_free_cpu_m: $best,
+          pending_seconds: $need.pending_seconds,
+          fit_node_count: ($fit | length), dest: $dest,
+          reason: (
+            if $class == "unschedulable" then
+              "no node in the cluster matches the pod'"'"'s selector, affinity or tolerations"
+            elif $class == "unzoned" then
+              "the claim'"'"'s PV declares no zone; this tool cannot place it"
+            elif $class == "no-destination" then
+              "zone \($zones | join(",")) has no node with room, and no other zone does either"
+            else
+              "zone \($zones | join(",")) has no node with room for this pod; move to \($dest)"
+            end) }
+    ] | unique_by([.namespace, .claim, .pod])'
+}
 
 # -------------------------------------------------------------------- detect
 
 do_detect() {
-  step "Usable nodes by zone (Ready AND schedulable)"
   zone_capacity_json > "$WORK/zones.json"
+  pinned_pvs_json    > "$WORK/pvs.json"
+  blocked_claims_json > "$WORK/blocked.json"
+
+  local findings count
+  findings=$(classify_claims_json)
+  count=$(jq 'length' <<<"$findings")
+
+  # --json prints the array and nothing else, so a caller can parse stdout.
+  if [ "$JSON" = 1 ]; then
+    echo "$findings"
+    [ "$count" = 0 ]
+    return
+  fi
+
+  step "Usable nodes by zone (Ready AND schedulable)"
   jq -r 'to_entries[] | "  \(.key): \(.value.nodes) node(s), \(.value.free_cpu_m)m CPU free"' \
     "$WORK/zones.json"
 
   step "Zone-pinned PersistentVolumes"
-  pinned_pvs_json > "$WORK/pvs.json"
-  local total stranded
-  total=$(jq 'length' "$WORK/pvs.json")
-  note "$total zone-pinned PV(s)"
-
+  note "$(jq 'length' "$WORK/pvs.json") zone-pinned PV(s)"
   jq -r '.[] | "  \(.zones|join(",")) \(.capacity)  \(.namespace)/\(.claim)"' "$WORK/pvs.json" | sort
 
-  step "Stranded volumes (no usable node in the PV's zone)"
-  stranded=$(jq -n --slurpfile z "$WORK/zones.json" --slurpfile p "$WORK/pvs.json" '
-    [ $p[0][] | select( [ .zones[] | ($z[0][.] // {nodes:0}).nodes ] | add == 0 ) ]')
-
-  if [ "$(echo "$stranded" | jq 'length')" = "0" ]; then
-    note "none — every zone-pinned volume has a usable node in its zone"
+  step "Blocked claims"
+  if [ "$count" = 0 ]; then
+    note "none — every pending claim has a node its pod may run on, with room"
     return 0
   fi
 
-  echo "$stranded" | jq -r '.[] |
-    "  STRANDED  \(.namespace)/\(.claim)\n            zone \(.zones|join(",")) has no usable node\n            relocate with: --namespace \(.namespace) --pvc \(.claim)"'
+  jq -r '.[] |
+    "  \(.class | ascii_upcase)  \(.namespace)/\(.claim)  (pod \(.pod), pending \(.pending_seconds)s)\n            \(.reason)"
+    + (if .class == "stranded" then
+        "\n            relocate with: --namespace \(.namespace) --pvc \(.claim)"
+       else "" end)' <<<"$findings"
   return 1
 }
 
@@ -552,43 +653,27 @@ do_heal() {
   pinned_pvs_json > "$WORK/pvs.json"
   blocked_claims_json > "$WORK/blocked.json"
 
-  # A volume is stranded when the pod that wants it cannot be placed in any zone
-  # the volume allows -- either because no node is there, or because no node
-  # there has room. Both leave the pod equally stuck.
+  # classify_claims_json is the one test; detect prints the same verdict.
   #
-  # MIN_PENDING_SECONDS keeps a pod that is merely mid-schedule out of it. It is
-  # read off the PodScheduled condition, not waited for.
-  local stranded count
-  stranded=$(jq -n \
-    --slurpfile z "$WORK/zones.json" \
-    --slurpfile p "$WORK/pvs.json" \
-    --slurpfile b "$WORK/blocked.json" \
-    --argjson minage "${MIN_PENDING_SECONDS:-120}" '
-    [ $b[0][]
-      | select(.pending_seconds >= $minage)
-      | . as $need
-      | ($p[0][] | select(.namespace == $need.namespace and .claim == $need.claim))
-      | . as $pv
-      # Only nodes the pod could run on count, in the zone of the volume and elsewhere.
-      | ($need.fit_nodes) as $fit
-      | ($pv.zones | map(($z[0][.] // {usable_nodes:[]}).usable_nodes[]?
-          | select(.name as $n | $fit | index($n)) | .free_cpu_m)) as $free
-      | ($free | max // 0) as $best
-      # No usable node at all strands the volume, whatever the pod asks for.
-      # Without this, a pod with no CPU request never counts: 0 < 0 is false.
-      | select(($free | length) == 0 or $best < $need.cpu_m)
-      # The destination is a zone the volume is not in, with one node that has
-      # room for the pod. The most free CPU wins. Null when no zone qualifies.
-      | ($z[0] | to_entries
-          | map(select(.key as $k | ($pv.zones | index($k)) == null)
-                | select(([.value.usable_nodes[]? | select(.name as $n | $fit | index($n))
-                           | .free_cpu_m] | max // -1) >= $need.cpu_m))
-          | sort_by(-.value.free_cpu_m) | .[0].key // null) as $dest
-      | $pv + { needs_cpu_m: $need.cpu_m, pod: $need.pod,
-                pending_seconds: $need.pending_seconds, best_free_cpu_m: $best,
-                dest: $dest }
-    ] | unique_by(.pv)')
-  count=$(echo "$stranded" | jq 'length')
+  # MIN_PENDING_SECONDS, which it applies, keeps a pod that is merely
+  # mid-schedule out of it: it is read off the PodScheduled condition, never
+  # waited for. That makes WHEN this runs load-bearing -- a pod that went
+  # Pending less than MIN_PENDING_SECONDS ago is invisible here, so running
+  # straight after an unpark finds nothing and the caller must let the cluster
+  # settle first.
+  local findings stranded other count
+  findings=$(classify_claims_json)
+  stranded=$(jq '[.[] | select(.class == "stranded")]' <<<"$findings")
+  other=$(jq    '[.[] | select(.class != "stranded")]' <<<"$findings")
+  count=$(jq 'length' <<<"$stranded")
+
+  # Everything heal cannot move, said out loud. These used to be dropped in
+  # silence, which is how a permanently unschedulable pod survived an unpark
+  # that reported success.
+  if [ "$(jq 'length' <<<"$other")" != "0" ]; then
+    note "$(jq 'length' <<<"$other") claim(s) heal cannot move:"
+    jq -r '.[] | "  \(.class | ascii_upcase)  \(.namespace)/\(.claim)  pod \(.pod): \(.reason)"' <<<"$other"
+  fi
 
   if [ "$count" = "0" ]; then
     note "nothing stranded"
@@ -604,16 +689,11 @@ do_heal() {
     return 0
   fi
 
-  local ns claim dest moved=0 skipped=0
+  # Every entry here is class "stranded", so each one has a destination zone.
+  # The ones without are class "no-destination" and were reported above.
+  local ns claim dest moved=0
   while read -r ns claim dest; do
     [ -n "$ns" ] || continue
-    if [ "$dest" = "null" ]; then
-      # A move to a zone without room leaves the pod Pending there too. Skip the
-      # volume and go on with the others.
-      note "SKIP $ns/$claim: no other zone has a node with room for its pod"
-      skipped=$((skipped + 1))
-      continue
-    fi
     # do_relocate reads these globals.
     NAMESPACE="$ns"; PVC="$claim"; TO_AZ="$dest"
     step "Healing $ns/$claim"
@@ -622,10 +702,15 @@ do_heal() {
     # snapshot plus source volume of this one are still in place.
     do_relocate
     moved=$((moved + 1))
-  done < <(echo "$stranded" | jq -r '.[] | "\(.namespace) \(.claim) \(.dest // "null")"')
+  done < <(echo "$stranded" | jq -r '.[] | "\(.namespace) \(.claim) \(.dest)"')
 
-  step "Relocated $moved volume(s), skipped $skipped"
-  [ "$skipped" = 0 ] || die "$skipped stranded volume(s) have no zone to move to"
+  local nowhere
+  nowhere=$(jq '[.[] | select(.class == "no-destination")] | length' <<<"$other")
+  step "Relocated $moved volume(s), $nowhere with nowhere to go"
+  # A volume with no destination is still a stuck pod. Fail, as before, so the
+  # caller does not read a success. The other classes are not heal's to fix and
+  # are reported without failing; the pod check is what should act on those.
+  [ "$nowhere" = 0 ] || die "$nowhere stranded volume(s) have no zone to move to"
 }
 
 case "$MODE" in

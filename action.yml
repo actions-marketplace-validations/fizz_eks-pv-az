@@ -32,11 +32,21 @@ inputs:
     description: 'relocate only: destination AZ. Blank picks the zone with the most free CPU.'
     required: false
     default: ''
+  json:
+    description: 'detect only: put the verdict in the findings output as JSON. The step still fails when there is a finding, so add continue-on-error to read the output and decide for yourself.'
+    required: false
+    default: 'false'
+
+outputs:
+  findings:
+    description: 'detect with json=true: a JSON array of blocked claims, each with a class (stranded, no-destination, unschedulable, unzoned) and a reason. Empty array when nothing is blocked.'
+    value: ${{ steps.run.outputs.findings }}
 
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: run
+      shell: bash
       env:
         MODE: ${{ inputs.mode }}
         CONTEXT: ${{ inputs.context }}
@@ -45,6 +55,7 @@ runs:
         NS: ${{ inputs.namespace }}
         PVC_NAME: ${{ inputs.pvc }}
         TO_AZ: ${{ inputs.to_az }}
+        JSON: ${{ inputs.json }}
       run: |
         # GITHUB_ACTION_PATH is where this action's own files were placed, which
         # is what makes the script reachable without the caller checking out.
@@ -57,4 +68,24 @@ runs:
         [ -n "$PVC_NAME" ] && set -- "$@" --pvc "$PVC_NAME"
         [ -n "$TO_AZ" ] && set -- "$@" --to "$TO_AZ"
 
-        "$SCRIPT" "$@"
+        if [ "$JSON" != "true" ]; then
+          "$SCRIPT" "$@"
+          exit $?
+        fi
+
+        # Under --json the verdict is the whole of stdout, so it is captured
+        # rather than streamed. Write the output BEFORE exiting non-zero, so a
+        # caller using continue-on-error can still read it. The human narration
+        # is on stderr and reaches the log as it happens.
+        set +e
+        out=$("$SCRIPT" "$@" --json)
+        rc=$?
+        set -e
+        d="findings_$RANDOM$RANDOM"
+        {
+          echo "findings<<$d"
+          echo "${out:-[]}"
+          echo "$d"
+        } >> "$GITHUB_OUTPUT"
+        echo "$out"
+        exit $rc

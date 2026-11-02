@@ -19,13 +19,40 @@ Pin to a commit SHA, not a branch. The action runs `kubectl` and `aws` against t
 
 | Mode | What it does |
 |---|---|
-| `detect` | Read-only. Lists bound volumes in a zone with no usable node. |
-| `heal` | For every `Pending` pod blocked by volume affinity, moves its volume to a zone with a node the pod can run on. |
+| `detect` | Read-only. Reports every pending claim whose pod cannot be placed, and why. Exits 1 on any finding. |
+| `heal` | Moves the volume of every stranded claim to a zone with a node its pod can run on, and names the ones it cannot move. |
 | `relocate` | Moves one PVC (`namespace`, `pvc`, optional `to_az`). |
+
+`detect` and `heal` share one verdict, so they cannot disagree about whether a pod is stuck. Each finding carries a class:
+
+| Class | Meaning | Can `heal` fix it? |
+|---|---|---|
+| `stranded` | The pod has nodes it may run on, none in the volume's zone has room, and another zone does. | Yes, it moves the volume there. |
+| `no-destination` | Stranded, but no zone has a node with room for the pod. Moving the volume only strands it elsewhere. | No. `heal` reports it and fails. |
+| `unschedulable` | No node in the cluster matches the pod's `nodeSelector`, required affinity or tolerations. | No. The placement or the node groups have to change. |
+| `unzoned` | The claim's PV declares no zone, so this tool cannot place it. Common with a hand-made PV. | No, but it is named rather than passed over in silence. |
+
+### Reading the verdict from a workflow
+
+```yaml
+- id: pv
+  uses: fizz/eks-pv-az@<commit SHA>
+  continue-on-error: true        # the step fails when there is a finding
+  with:
+    mode: detect
+    context: my-cluster
+    region: us-east-1
+    json: 'true'
+- run: echo '${{ steps.pv.outputs.findings }}' | jq -r '.[] | "\(.class) \(.namespace)/\(.claim)"'
+```
+
+By hand, `--json` puts the array on stdout and nothing else, so it pipes into `jq` directly. The human narration goes to stderr.
+
+**When this runs matters.** A pod that went `Pending` less than `MIN_PENDING_SECONDS` ago (default 120) is excluded on purpose, so that a pod mid-schedule is not called stuck. Running straight after an unpark therefore finds nothing: let the cluster settle first, or the scan passes over the very pods the unpark stranded.
 
 ## Which nodes count
 
-In `heal`, a node is a candidate for a pod only if the pod can run on it:
+In `detect` and `heal`, a node is a candidate for a pod only if the pod can run on it:
 
 - the node matches the pod's `nodeSelector`,
 - the node matches one of the pod's required `nodeAffinity` terms,
